@@ -6,11 +6,11 @@
     "course": "자동제어 - 2026 봄",
     "ai_usage": "Claude: planning, lateral/vertical/coordinator design, report. ChatGPT: longitudinal ABS design."
   },
-  "timestamp": "2026-06-23T09:29:12",
+  "timestamp": "2026-06-23T22:48:25",
   "quantitative": {
-    "score": 60.780403604589821,
+    "score": 64,
     "max": 70,
-    "pct": 86.829148006556892
+    "pct": 91.428571428571431
   },
   "deductions": {
     "amount": 0,
@@ -85,7 +85,7 @@
     {
       "sid": "A7",
       "kpi": "sideSlipMax",
-      "value": 2.1618622010039878,
+      "value": 2.4702853595046093,
       "target": 5,
       "score": 8,
       "max": 8
@@ -93,7 +93,7 @@
     {
       "sid": "A7",
       "kpi": "LTR_max",
-      "value": 0.32047312149036977,
+      "value": 0.3309813739391762,
       "target": 0.7,
       "score": 7,
       "max": 7
@@ -101,23 +101,23 @@
     {
       "sid": "B1",
       "kpi": "stoppingDistance",
-      "value": 67.583424369622733,
+      "value": 66.477714956366455,
       "target": 66.5,
-      "score": 4.8370790421619958,
+      "score": 5,
       "max": 5
     },
     {
       "sid": "B1",
       "kpi": "absSlipRMS",
-      "value": 0.19170026312716504,
+      "value": 0.086285478867368315,
       "target": 0.1,
-      "score": 1.9433245624278321,
+      "score": 5,
       "max": 5
     },
     {
       "sid": "D1",
       "kpi": "sideSlipMax",
-      "value": 3.1568067158462219,
+      "value": 3.2005265450893332,
       "target": 4,
       "score": 4,
       "max": 4
@@ -139,8 +139,8 @@
       "max": 2
     }
   ],
-  "final_auto": 60.780403604589821,
-  "ctrl_signature": "0b5402415802ce849f87030081a7c1896dfb75c7ac902757f93c322eeac9c262",
+  "final_auto": 64,
+  "ctrl_signature": "36c86e253bf35d442eb956eca2c442d59b5fb8e3504b91af6aecafd27961bdb3",
   "matlab_version": "25.2 (R2025b)",
   "solver_used": "ode45"
 }

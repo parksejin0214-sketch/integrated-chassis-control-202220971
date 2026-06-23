@@ -1,349 +1,288 @@
-즉 시나리오가 제공하는 `brk_scenario`(B1의 경우 거의 MAX_BRAKE_TRQ)에 우리 출력이 더해진다. 이 합산 후 `[0, MAX_BRAKE_TRQ]`로 클리핑되므로, 우리가 양의 값을 추가해도 효과가 없다. **음의 값(brake release)이 필요하다.**
+# Integrated Chassis Control Term Project Report
 
-이를 위해 본인은 출력 구조에 `forceCmd.brakeTorqueAdd` (4×1, 음수 허용)를 추가했다. 이는 runner가 인식하는 추가 채널.
+- Course: 자동제어 - 2026 봄
+- Student ID: 202220971
+- Name: 박세진
+- MATLAB: R2025b
+- Solver: ode45
 
-**P-band 컨트롤러**
+## 1. 프로젝트 목적
 
-매 step의 wheel slip $\kappa_i$ ($i \in \{FL, FR, RL, RR\}$)에 대해 error $e_i = \kappa_i - \kappa_{\text{ref}}$를 계산하고:
+본 프로젝트의 목표는 제공된 BMW 5-series 기반 14DOF 차량 plant와 표준 시험 시나리오에서 통합 샤시 제어기를 설계하고, 제어기 OFF baseline 대비 주행 안정성, 제동 성능, 수직 감쇠 응답을 정량적으로 개선하는 것이다. 수정 범위는 `scripts/control/ctrl_*.m`, `student_info.m`, `docs/report.md`, 그리고 허용된 설정 항목으로 제한되어 있으므로, driver, plant, KPI, scenario 코드는 변경하지 않는 것을 원칙으로 하였다.
+
+최종 설계는 네 개의 controller로 구성된다.
+
+- `ctrl_lateral.m`: yaw-rate tracking AFS와 side-slip 기반 ESC yaw moment 생성
+- `ctrl_longitudinal.m`: wheel slip ratio 기반 ABS brake release/additive torque 생성
+- `ctrl_vertical.m`: hybrid skyhook-groundhook CDC damping
+- `ctrl_coordinator.m`: steering, brake, damping actuator allocation
+
+최종 자동채점 결과는 `64.00 / 70.00`이며 runtime error와 deduction은 없다.
+
+## 2. 시스템 및 과제 개요
+
+채점 대상 P1 시나리오는 A3, A1, A4, A7, B1, D1이다. 각 시나리오는 서로 다른 안정성 지표를 본다.
+
+| 시나리오 | 목적 | 주요 KPI |
+|---|---|---|
+| A3 | Step steer yaw response | overshoot, rise time, settling time |
+| A1 | ISO 3888-1 double lane change | side-slip, LTR, lateral deviation |
+| A4 | Steady-state circular | understeer gradient, side-slip |
+| A7 | Brake-in-turn | side-slip, LTR |
+| B1 | Straight braking | stopping distance, ABS slip RMS |
+| D1 | DLC + braking integration | side-slip, LTR, lateral deviation |
+
+제어기 설계에서 가장 중요한 trade-off는 A1/D1의 path tracking과 A7/D1의 stability 사이의 균형이었다. AFS를 강하게 만들면 yaw response는 좋아지지만 Stanley path-following driver와 경쟁해 lateral deviation이 커질 수 있다. 반대로 AFS/ESC를 줄이면 A7 brake-in-turn과 D1 combined maneuver에서 side-slip이 커질 위험이 있었다. 최종 설계는 lateral deviation 점수보다 runtime 안정성, side-slip 억제, LTR 제한, B1 ABS 만점을 우선하였다.
+
+## 3. 수학적 모델링 및 설계 근거
+
+### 3.1 Lateral Control
+
+횡방향 제어의 기본 오차는 yaw-rate reference와 실제 yaw rate의 차이이다.
+
+$$
+e_r = r_{\text{ref}} - r
+$$
+
+여기서 $r_{\text{ref}}$는 driver steering input으로부터 bicycle-model 기반 함수 `calc_ref_yaw_rate`가 계산한다. AFS 보조 조향은 PID 형태로 계산하였다.
+
+$$
+\delta_{\text{pid}} = K_p e_r + K_i \int e_r dt + K_d \dot e_r
+$$
+
+단, 속도에 따라 차량 응답과 tire utilization margin이 달라지므로 다음 gain scheduling을 적용하였다.
+
+$$
+s_v = \text{sat}_{[0.30, 2.00]}\left({20 \over \max(v_x, 5)}\right)
+$$
+
+$$
+K_p = 2.5 K_{p0}s_v,\quad K_i = 0.3 K_{i0}s_v,\quad K_d = 2.0 K_{d0}s_v
+$$
+
+미분항은 20 ms time constant의 1차 저역통과 필터로 완화했다.
+
+$$
+\alpha_d = {dt \over 0.02 + dt}
+$$
+
+AFS가 path-following driver를 과하게 방해하지 않도록 side-slip angle이 커질수록 steer assist를 줄였다.
+
+$$
+\delta_{\text{AFS}} = s_\beta \delta_{\text{pid}}
+$$
+
+$|\beta| \le 0.8^\circ$에서는 $s_\beta=1.0$이고, $|\beta| \ge 2.2^\circ$에서는 $s_\beta=0.12$로 제한한다. 이 설계는 A3/A4 yaw response는 유지하면서 A1/D1에서 AFS가 path tracking을 지나치게 왜곡하는 것을 줄이기 위한 것이다.
+
+ESC yaw moment는 side-slip angle이 커질 때만 작동한다.
+
+$$
+M_z = -K_\beta \operatorname{sign}(\beta)(|\beta|-\beta_{\text{on}})s_v b_\beta
+$$
+
+최종 구현값은 $\beta_{\text{on}}=2.0^\circ$, $\beta_{\text{full}}=3.2^\circ$, $K_\beta=54000$이며 yaw moment는 $\pm 12000$ Nm로 saturation하였다.
+
+### 3.2 Longitudinal Control and ABS
+
+B1 straight braking에서는 scenario가 큰 brake command를 이미 제공한다. 이 상태에서 양의 brake torque를 더해도 actuator saturation에 걸리므로 ABS에는 brake release가 필요하다. 따라서 `ctrl_longitudinal.m`은 `forceCmd.brakeTorqueAdd`를 사용해 per-wheel additive torque를 만든다. 이 값은 음수가 될 수 있고, `ctrl_coordinator.m`과 runner를 거쳐 최종 brake command에 더해진 뒤 `[0, LIM.MAX_BRAKE_TRQ]` 범위로 clamp된다.
+
+ABS는 직전 step wheel slip ratio $\kappa_i$를 사용한다.
+
+$$
+e_{\kappa,i} = \kappa_i - \kappa_{\text{ref}}
+$$
+
+최종 target은 $\kappa_{\text{ref}}=-0.125$로 두었다. 기존 dead-band 방식은 rear wheel lock이 저속 구간에서 남아 `absSlipRMS`가 커지는 문제가 있었다. 최종 구현은 dead-band 없이 연속 P 제어를 사용한다.
 
 $$
 \tau_{\text{ABS},i} =
 \begin{cases}
-K_{\text{release}} \cdot (e_i + \delta_{\text{rel}}), & e_i < -\delta_{\text{rel}} \quad (\text{lock 경향 → release}) \\
-K_{\text{add}} \cdot (e_i - \delta_{\text{add}}), & e_i > \delta_{\text{add}} \quad (\text{제동 부족 → small add}) \\
-0, & \text{otherwise (dead-band)}
+K_{\text{release}} e_{\kappa,i}, & e_{\kappa,i}<0 \\
+K_{\text{add}} e_{\kappa,i}, & e_{\kappa,i}\ge 0
 \end{cases}
 $$
 
-상수: $K_{\text{release}} = 7200, K_{\text{add}} = 1800, \delta_{\text{rel}} = 0.015, \delta_{\text{add}} = 0.030$. release 게인을 add 게인의 4배로 둔 것은 lock이 release보다 회복이 어렵기 때문(비대칭 제어).
-
-**전후축 권한 조정**
+사용한 값은 $K_{\text{release}}=7200$, $K_{\text{add}}=1800$이다. Release gain을 더 크게 둔 이유는 wheel lock을 빠르게 해소하는 것이 stopping distance와 slip RMS 모두에 더 중요했기 때문이다. 전후축 authority는 하중이동을 고려해 다음과 같이 조정했다.
 
 $$
 \tau_{\text{ABS}} \leftarrow \tau_{\text{ABS}} \odot [1.20, 1.20, 0.85, 0.85]^T
 $$
 
-전축은 제동 시 하중이동으로 $F_z$가 증가해 더 큰 토크 변동에도 안정적. 후축은 lock하면 차량이 oversteer로 spin이 나서 보수적으로.
-
-**Brake detection**
-
-ABS가 항상 켜져 있으면 비제동 시나리오(A3/A1/A4/A7 turn-in)에서 오작동할 수 있다. 다음 조건이 모두 충족될 때만 활성:
+ABS는 다음 조건에서만 켜진다.
 
 $$
-v_x > 2 \text{ m/s} \land a_x < -1 \text{ m/s}^2 \land \min(\kappa_i) < -0.04
+v_x > 0.3\ \text{m/s},\quad a_x < -1.0\ \text{m/s}^2,\quad \min(\kappa_i)<-0.04
 $$
 
-**1차 LPF**
+초기 구현의 $v_x>2.0$ 조건은 정지 직전 rear wheel lock을 충분히 풀지 못해 `absSlipRMS`가 커졌다. 최종 설계에서는 저속까지 ABS를 유지해 B1 두 KPI 모두 만점을 얻었다.
 
-$\tau = 10$ ms 저역통과로 actuator chattering 억제.
+### 3.3 Vertical Control
 
-### 3.3 ctrl_vertical — Hybrid Skyhook-Groundhook
+`ctrl_vertical.m`은 semi-active damping을 위해 hybrid skyhook-groundhook logic을 사용한다. 각 wheel corner에서 sprung velocity $\dot z_s$, unsprung velocity $\dot z_u$, relative velocity $\dot z_s-\dot z_u$를 계산한다.
 
-각 휠에 대해 sprung/unsprung velocity 부호 검사:
-
-$$
-\text{sky}_i = 1 \text{ if } \dot z_{s,i} \cdot (\dot z_{s,i} - \dot z_{u,i}) > 0 \text{ else } 0
-$$
+Skyhook 조건:
 
 $$
-\text{ground}_i = 1 \text{ if } \dot z_{u,i} \cdot (-(\dot z_{s,i} - \dot z_{u,i})) > 0 \text{ else } 0
+\dot z_s(\dot z_s-\dot z_u)>0
 $$
 
-$$
-\text{score}_i = \alpha \cdot \text{sky}_i + (1-\alpha) \cdot \text{ground}_i, \quad \alpha = 0.7
-$$
-
-$\alpha$를 0.7로 잡은 것은 본 과제 P1 시나리오가 ride comfort보다 핸들링·제동 KPI 중심이라는 점을 고려해 sprung mass 안정화(skyhook) 비중을 높이고, 그러면서도 wheel hop 제어를 위한 groundhook을 30% 남긴 trade-off.
-
-감쇠 명령:
+Groundhook 조건:
 
 $$
-c_i =
-\begin{cases}
-c_{\max} = 5000, & \text{score}_i > 0.5 \\
-c_{\text{nom}} + (c_{\max} - c_{\text{nom}}) \cdot \text{score}_i, & 0 < \text{score}_i \leq 0.5 \\
-c_{\min} = 500, & \text{score}_i \leq 0
-\end{cases}
+\dot z_u(-(\dot z_s-\dot z_u))>0
 $$
 
-여기서 $c_{\text{nom}} = (c_{\min} + c_{\max})/2 = 2750$ N·s/m. 1차 LPF $\tau = 50$ ms로 chattering 억제.
-
-### 3.4 ctrl_coordinator — Allocation + 마찰원
-
-**AFS pass-through**: latCmd.steerAngle을 `LIM.MAX_STEER_ANGLE` 안에서 saturate해 actuator로 그대로 전달.
-
-**종방향 brake 분배 (60:40 split)**: $F_x < 0$ (제동) 시,
+최종 score는 skyhook 70%, groundhook 30%로 구성하였다.
 
 $$
-T_{\text{lon},FL} = T_{\text{lon},FR} = 0.30 \cdot |F_x \cdot \text{brakeRatio}| \cdot r_w
-$$
-$$
-T_{\text{lon},RL} = T_{\text{lon},RR} = 0.20 \cdot |F_x \cdot \text{brakeRatio}| \cdot r_w
+\text{score}=0.7\cdot \text{sky}+0.3\cdot \text{ground}
 $$
 
-전후 60:40은 일반 세단의 정적 무게 분포 + 동적 하중이동을 고려한 표준 값. $r_w = 0.31$ m.
+감쇠계수는 `CTRL.VER.cMin=500`, `CTRL.VER.cMax=5000` 범위에서 결정하고, 50 ms LPF로 chattering을 줄였다. P1 채점은 ride KPI보다 handling/braking KPI 중심이므로, 수직 제어는 aggressive한 가점 튜닝보다 기본 안정성과 tire contact 유지에 중점을 두었다.
 
-**ESC yaw moment → 차동 brake**:
+### 3.4 Coordinator and Actuator Allocation
 
-$$
-\Delta T_f = \text{ratio}_f \cdot M_z / t_f \cdot r_w, \quad \Delta T_r = (1-\text{ratio}_f) \cdot M_z / t_r \cdot r_w
-$$
+`ctrl_coordinator.m`는 세 controller 명령을 실제 actuator command로 변환한다.
 
-ratio_f = 0.6 (전축 60%, 후축 40%). track $t_f = t_r = 1.55$ m.
+AFS는 steer command를 그대로 통과시키되 `LIM.MAX_STEER_ANGLE` 안에서 제한한다.
 
-$M_z > 0$ (CCW 가속 방향)이면 우측 휠 제동 증가:
+ESC yaw moment는 front/rear 65:35 비율로 differential brake torque에 배분한다.
 
 $$
-T_{\text{esc}} = [-\Delta T_f, +\Delta T_f, -\Delta T_r, +\Delta T_r]^T
+\Delta T_f = 0.65 {M_z \over t_f} r_w,\quad
+\Delta T_r = 0.35 {M_z \over t_r} r_w
 $$
 
-**마찰원 제한 (가점 +3)**
-
-각 휠 brake torque로 인한 종방향 힘 $F_{x,i} = T_i / r_w$. 이게 보수 마진 80%의 마찰원 한계를 넘으면 scale-down:
+휠별 brake torque contribution은 다음 sign convention을 따른다.
 
 $$
-\text{if } F_{x,i} > 0.8 \mu F_{z,i}: \quad T_i \leftarrow 0.8 \mu F_{z,i} \cdot r_w
+T_{\text{esc}}=[-\Delta T_f,\ +\Delta T_f,\ -\Delta T_r,\ +\Delta T_r]^T
 $$
 
-$F_z$ 추정은 정적 분포 $mg/4$ 사용(보수적). $\mu = 1.0$(dry road).
+ABS의 `brakeTorqueAdd`가 있으면 longitudinal torque는 그 값을 우선 사용한다. 이는 B1처럼 scenario brake가 이미 saturation 근처에 있는 경우에도 음수 torque release를 전달하기 위함이다.
 
-이는 가점 항목 "마찰원 + WLS allocation 구현"의 핵심 부분에 해당한다(+3 pt).
-
-**최종 제동 토크 합산 + 클리핑**:
+Positive brake addition에는 간단한 friction/authority protection을 적용하였다.
 
 $$
-T_{\text{brake}} = \max(0, T_{\text{lon}} + T_{\text{esc}}), \quad T_{\text{brake}} \in [0, \text{LIM.MAX\_BRAKE\_TRQ}]
+T_i \le 0.90 {mg \over 4} r_w
 $$
 
-음수 클립은 brake가 음의 토크를 낼 수 없기 때문(자유롭게 가속하지 못함).
-
----
+이는 strict WLS optimizer는 아니며, 본 프로젝트 구현은 simple split + static-load friction margin 방식이다. 보고서에서는 실제 구현과 맞지 않는 WLS claim을 하지 않는다.
 
 ## 4. 시뮬레이션 결과
 
-### 4.1 P1 시나리오 KPI 표 (자동 채점 결과)
+다음 결과는 2026-06-23 KST에 `scripts/grade.m`을 MATLAB R2025b, solver `ode45`로 실행해 생성한 `grade_report.json` 기준이다. 학교 공지에 따라 B1 stopping distance 만점 기준은 `66.5 m`로 해석하였다.
 
-다음은 `scripts/grade.m` 실행 결과(2026-06-23 03:55, MATLAB R2023a, solver=ode45).
-
-| sid | KPI | OFF (baseline) | ON (designed) | 임계 (target) | 점수/만점 |
+| sid | KPI | OFF baseline | ON designed | Target | Score |
 |---|---|---:|---:|---:|---:|
-| A3 | yawRateOvershoot [%] | 2.70 | **2.09** | ≤10 | **4/4** |
-| A3 | yawRateRiseTime [s] | 0.247 | **0.110** | ≤0.3 | **4/4** |
-| A3 | yawRateSettling [s] | 1.462 | **0.643** | ≤0.8 | **4/4** |
-| A1 | sideSlipMax [°] | 3.015 | **1.944** | ≤3.0 | **6/6** |
-| A1 | LTR_max | 0.864 | **0.598** | ≤0.6 | **5/5** |
-| A1 | lateralDevMax [m] | 1.827 | 2.123 | ≤0.7 | 0/4 |
-| A4 | understeerGradient | 0.0007 | **0.0008** | 0.003 ± 80% | **5/5** |
-| A4 | sideSlipMax [°] | 1.184 | **1.176** | ≤2.0 | **5/5** |
-| A7 | sideSlipMax [°] | 30.478 | **2.162** | ≤5.0 | **8/8** |
-| A7 | LTR_max | 0.681 | **0.321** | ≤0.7 | **7/7** |
-| B1 | stoppingDistance [m] | 72.30 | **67.58** | ≤66.5 | **4.84/5** |
-| B1 | absSlipRMS | 0.730 | **0.192** | ≤0.10 | 1.94/5 |
-| D1 | sideSlipMax [°] | 4.906 | **3.157** | ≤4.0 | **4/4** |
-| D1 | LTR_max | 0.864 | **0.566** | ≤0.6 | **2/2** |
-| D1 | lateralDevMax [m] | 1.827 | 2.123 | ≤1.0 | 0/2 |
-| **합** | | | | | **60.78 / 70** |
+| A3 | yawRateOvershoot [%] | 2.6997 | **2.0894** | <= 10 | **4/4** |
+| A3 | yawRateRiseTime [s] | 0.2470 | **0.1100** | <= 0.3 | **4/4** |
+| A3 | yawRateSettling [s] | 1.4620 | **0.6430** | <= 0.8 | **4/4** |
+| A1 | sideSlipMax [deg] | 3.0154 | **1.9444** | <= 3.0 | **6/6** |
+| A1 | LTR_max [-] | 0.8635 | **0.5981** | <= 0.6 | **5/5** |
+| A1 | lateralDevMax [m] | 1.8270 | 2.1230 | <= 0.7 | 0/4 |
+| A4 | understeerGradient | 0.0007 | **0.0008** | 0.003 +/- 80% | **5/5** |
+| A4 | sideSlipMax [deg] | 1.1839 | **1.1760** | <= 2.0 | **5/5** |
+| A7 | sideSlipMax [deg] | 30.4776 | **2.4703** | <= 5.0 | **8/8** |
+| A7 | LTR_max [-] | 0.6808 | **0.3310** | <= 0.7 | **7/7** |
+| B1 | stoppingDistance [m] | 72.2992 | **66.4777** | <= 66.5 | **5/5** |
+| B1 | absSlipRMS [-] | 0.7295 | **0.0863** | <= 0.10 | **5/5** |
+| D1 | sideSlipMax [deg] | 4.9057 | **3.2005** | <= 4.0 | **4/4** |
+| D1 | LTR_max [-] | 0.8635 | **0.5659** | <= 0.6 | **2/2** |
+| D1 | lateralDevMax [m] | 1.8270 | 2.1230 | <= 1.0 | 0/2 |
+| **Total** | | | | | **64.00 / 70** |
 
-13개 KPI 만점, 2개 부분점수, 2개 0점(lateralDev). 자동채점 점수 비율 86.8%.
+### 4.1 A7 Brake-in-Turn
 
-### 4.2 핵심 plot — A7 Brake-in-Turn 비교
+![A7 side-slip response](figures/a7_sideSlip.png)
 
-![A7 sideSlip 비교](figures/a7_sideSlip.png)
-*그림 4.1 — A7 ISO 7975 brake-in-turn, sideSlipMax 시계열. 베이스라인(빨강)이 30°까지 발산하며 사실상 spin-out 상태인 반면, 설계 제어기(파랑)는 2.2°에서 안정화. 핵심 메커니즘은 ctrl_lateral의 β-limiter가 $|\beta| > 3°$ 시 yaw moment를 인가하고, ctrl_coordinator가 이를 4륜 brake 차동으로 변환한 것.*
+A7은 baseline에서 sideSlipMax가 30.48 deg까지 커져 사실상 spin-out에 가까운 응답을 보였다. 설계 제어기 ON에서는 sideSlipMax가 2.47 deg로 줄었고 LTR도 0.331로 충분한 margin을 확보했다. 주된 원인은 side-slip 기반 ESC yaw moment와 coordinator의 differential brake allocation이다.
 
 ![A7 trajectory](figures/a7_trajectory.png)
-*그림 4.2 — A7 차량 궤적. 베이스라인은 코너링+제동 결합 마찰원 한계를 넘어 trajectory가 outward로 발산(스핀아웃 직전). 설계 후 마찰원 마진 20%로 인해 의도된 경로 안정 유지.*
 
-### 4.3 B1 Straight Brake — ABS 효능
+Brake-in-turn에서는 횡력과 종방향 제동력이 동시에 tire friction을 사용하므로, brake differential을 과도하게 넣으면 오히려 tire utilization을 악화시킬 수 있다. 따라서 coordinator에서 positive brake authority를 제한하고, ABS release는 음수 additive torque로 허용했다.
+
+### 4.2 B1 Straight Braking
 
 ![B1 wheel slip](figures/b1_kappa.png)
-*그림 4.3 — B1 100→0 km/h dry straight brake. 베이스라인(빨강)에서 4륜 모두 즉시 $|\kappa| \to 1$(완전 잠김)으로 발산. 설계 ABS(파랑)는 $\kappa$를 $-0.12$ 근방에서 oscillate, absSlipRMS 0.73 → 0.19로 감소. 다만 임계 0.10에는 미달.*
 
-![B1 deceleration](figures/b1_brake.png)
-*그림 4.4 — B1 종속도/감속도 비교. stoppingDistance 72.3 m → 67.6 m로 단축. MFDD가 8.32 m/s² → 9.53 m/s²로 증가해 마찰계수 활용률(μUtilization)이 0.85 → 0.97로 개선.*
+B1 baseline은 wheel lock으로 인해 `absSlipRMS=0.7295`가 나왔다. 최종 ABS 설계는 $\kappa_{\text{ref}}=-0.125$ 주변에서 slip을 조절해 `absSlipRMS=0.0863`으로 낮췄다.
 
-### 4.4 A1 DLC — Stanley driver와의 상호작용
+![B1 braking response](figures/b1_brake.png)
 
-![A1 path-following](figures/a1_path.png)
-*그림 4.5 — A1 ISO 3888-1 DLC, x-y 궤적. Reference path(검정 점선), baseline OFF(빨강), 설계 ON(파랑). sideSlipMax는 3.0° → 1.9°로 개선되었으나 path 추종 면에서는 lateralDevMax가 1.83 m → 2.12 m로 오히려 약간 악화. 이는 AFS yaw rate tracking이 Stanley driver의 path-following과 경쟁한 결과이며, §5.2에서 자세히 분석한다.*
+Stopping distance는 72.2992 m에서 66.4777 m로 감소했다. 학교 공지 기준인 66.5 m 이하를 만족하므로 B1의 두 KPI는 모두 만점이다. 단, margin이 0.0223 m로 크지는 않으므로 제출 직전 controller를 다시 수정하면 반드시 `grade.m`을 재실행해야 한다.
 
----
+### 4.3 A1 Double Lane Change
 
-## 5. 분석 + 한계
+![A1 path following](figures/a1_path.png)
 
-### 5.1 가장 성공적이었던 시나리오 — A7
+A1은 sideSlipMax와 LTR은 모두 target을 만족했다. 특히 LTR_max는 0.5981로 0.6 threshold 바로 아래이다. 그러나 lateralDevMax는 baseline 1.8270 m에서 controller ON 2.1230 m로 커져 0점을 받았다. 이는 AFS yaw-rate tracking이 Stanley driver의 path-following steering과 같은 actuator channel에서 합쳐지면서 path deviation을 악화시킨 것으로 해석한다.
 
-A7 brake-in-turn에서 sideSlipMax 30.5° → 2.2°로 94% 감소했다. 이는 다음 두 메커니즘이 협력한 결과다:
+## 5. 결과 분석
 
-1. **β-limiter (ctrl_lateral)**: 운전자가 코너링 중 제동을 시작하면 횡력 marginal한 상황에서 β가 급증한다. 본 설계의 hysteresis (3° on / 2° off) 덕에 한 번 작동하면 마진 회복까지 부드럽게 감쇠하면서 chattering 없이 안정화.
-2. **Coordinator의 brake 차동 + 마찰원 제한**: yaw moment를 외측 휠 제동으로 변환할 때 단순 분배가 아닌 0.8μF_z 마진을 두어, 코너링 횡력 손실을 막았다. baseline에서 tireUtilizationMax = 1.05(초과)였던 것이 ON에서는 1.00 부근으로 정확히 마찰원 안에 머문다.
+### 5.1 잘 된 부분
 
-### 5.2 가장 부족했던 시나리오 — A1/D1 lateralDevMax
+A3, A4, A7은 목표를 안정적으로 달성했다. A3 step steer에서는 rise time과 settling time이 줄어 yaw response가 빨라졌고, overshoot도 target보다 충분히 낮았다. A4 steady-state circular에서는 understeer gradient와 side-slip 모두 만점을 유지했다. A7 brake-in-turn에서는 ESC가 가장 효과적이었다. Baseline side-slip 30.48 deg를 2.47 deg로 낮추면서 LTR도 0.331로 유지했다.
 
-lateralDevMax는 임계 0.7 m / 1.0 m에 대해 OFF 자체가 1.83 m로 이미 fail이고, ON에서도 2.12 m로 개선되지 않았다(오히려 악화). 본인이 분석한 원인은 다음과 같다.
+B1은 최종 튜닝에서 가장 큰 개선이 있었다. 기존 dead-band ABS는 정지 직전 rear wheel lock을 충분히 해소하지 못했지만, 저속까지 작동하는 연속 P-band ABS로 바꾸면서 stoppingDistance와 absSlipRMS를 동시에 만점으로 만들었다.
 
-**가설 1: AFS와 Stanley driver의 경쟁**
+### 5.2 남은 한계
 
-`driver_dispatch.m`의 Stanley closed-loop driver는 매 step path 추종을 위해 $\delta_{\text{driver}}$를 계산한다. 본인의 ctrl_lateral은 yaw rate 추종을 위해 $\delta_{\text{AFS}}$를 추가하는데, 두 값이 같은 방향이면 과조향, 반대면 부족조향이 되어 어느 쪽이든 lateralDev를 늘릴 수 있다. 베이스라인 yaw rate ref 자체가 driver intent에서 파생된 값이므로 AFS가 적분 항으로 잔류오차를 0으로 만들면, Stanley가 의도한 fine-grained 경로 추종에 추가 외란이 된다.
+가장 큰 한계는 A1/D1 lateralDevMax이다. 두 시나리오 모두 baseline 자체가 target보다 크고, controller ON에서는 2.1230 m까지 증가했다. 현재 controller API에는 path error나 lane boundary 정보가 직접 들어오지 않는다. `ctrl_lateral.m`은 yawRateRef, yawRate, slipAngle, vx만 받아서 AFS/ESC를 생성하므로, path deviation 자체를 직접 feedback으로 줄이기 어렵다.
 
-**가설 2: Reference path-cone 간 구조적 거리**
+lateralDev 개선을 위해 AFS를 약하게 만들면 path deviation은 baseline에 가까워질 수 있지만, A7과 D1에서 side-slip 안정성이 나빠질 위험이 컸다. 실제로 A1 LTR이 0.5981로 threshold 0.6에 매우 가까우므로, lateral control을 더 공격적으로 바꾸는 것은 제출 안정성 측면에서 위험하다고 판단했다.
 
-ISO 3888-1 DLC의 cone 간격은 차량 폭 + 30 cm 여유 정도이므로 lateralDev = 1.8 m는 차량이 cone에 가까이 dribble하는 정상 trajectory에 해당할 수 있다. 임계 0.7 m는 path를 정확히 따라가야 도달 가능한 수치인데, Stanley driver 자체가 그 정도 정밀도를 보장하지 않는 듯하다.
+### 5.3 최종 설계 선택
 
-**검증 시도**
+최종 설계는 점수만을 위해 특정 scenario ID를 hard-code하지 않았다. 모든 로직은 speed, side-slip, wheel slip, acceleration 같은 물리량 기반 조건으로 구성했다. A1/D1 lateralDevMax를 남은 한계로 인정하되, runtime error 방지와 주요 stability KPI 만점을 우선하였다.
 
-본인은 AFS를 완전히 0으로 끄는 실험도 수행하였다. 결과는 lateralDev가 1.83 m로 복귀했지만 그러면 A7 sideSlipMax가 40°로 악화되어 점수가 훨씬 떨어졌다(60.78 → 25.25). 즉 AFS는 ESC와 짝을 이뤄 작동해야 의미가 있고, 이를 끄면 ESC도 무력화된다. lateralDev를 살리려면 ctrl_lateral 자체 설계가 아닌 driver layer 수정이 필요해 보이는데, 이는 본 과제 범위(scripts/control/만 수정 가능)를 벗어남.
+## 6. 제출 조건 및 무결성
 
-### 5.3 B1 absSlipRMS 부분점수의 원인
+수정 허용 범위와 관련해 다음을 확인하였다.
 
-B1에서 stoppingDistance는 4.84/5점으로 거의 만점이지만 absSlipRMS는 1.94/5에 그쳤다. 측정값 0.192는 임계 0.10의 약 2배.
+- `scripts/control/ctrl_lateral.m`: 수정 대상, 허용
+- `scripts/control/ctrl_longitudinal.m`: 수정 대상, 허용
+- `scripts/control/ctrl_vertical.m`: 수정 대상, 허용
+- `scripts/control/ctrl_coordinator.m`: 수정 대상, 허용
+- `scripts/student_info.m`: 학번/이름 기입 완료
+- `docs/report.md`: 본 보고서
+- `grade_report.json`: MATLAB `grade.m` 실행 결과
+- `config/sim_params.m`: 최종 제출 변경 없음
+- `scripts/grade.m`: 최종 제출 변경 없음
 
-P-band 컨트롤러의 release/add 게인 비대칭(4:1)을 더 극단적으로 했다면 더 빠른 slip 회복이 가능했을 것이다. 다만 release 게인을 너무 키우면 brake가 풀려 stoppingDistance가 길어지는 trade-off가 있다. 본인은 stoppingDistance와 absSlipRMS 합산 점수가 최대가 되는 지점에서 멈췄다(stopping 4.84 + absSlip 1.94 = 6.78점, 두 KPI 합 만점 10 중 67.8%).
+`grade_report.json`의 `ctrl_signature`는 네 개 `ctrl_*.m` 파일을 lateral, longitudinal, vertical, coordinator 순서로 concat하고 CRLF를 LF로 정규화한 SHA256 값이다. 제출 전 이 hash가 실제 파일과 일치해야 한다.
 
-PI 또는 PID로 확장하거나, 각 휠의 $\mu(\kappa)$ 곡선을 Pacejka 모델로 직접 추정해서 peak 추종을 하면 추가 개선이 가능할 것으로 예상되나, 4-6주 일정의 학부 과제 범위에서는 현재 P-band가 합리적 절충이라 판단했다.
+## 7. AI 활용 내역
 
-### 5.4 더 시간이 있었다면
+본 과제에서 Claude와 ChatGPT를 보조 도구로 사용하였다. AI는 코드 전체를 대신 작성하거나 최종 제출 판단을 자동으로 수행한 것이 아니라, 코드 구조 검토, KPI 해석, 디버깅 방향 제안, 튜닝 후보 비교, 보고서 문장 정리에 보조적으로 활용하였다. 최종 MATLAB 실행, 점수 확인, controller 선택, 제출 여부 판단은 본인이 수행하였다.
 
-- **A1/D1 lateralDev**: AFS가 lateral deviation > 0.5 m이면 출력을 점진적으로 감쇠시키는 조건부 AFS를 시도. 단 이는 "scenario-specific hardcoding"으로 해석될 수 있어 ASSIGNMENT §3.1 금지 사항인 "hardcoded scenario branching"과의 경계 검토 필요.
-- **B1 absSlipRMS**: PID + 적응 마찰계수 추정. Recursive least squares로 $\mu_{\text{peak}}$ 온라인 추정 후 $\kappa_{\text{ref}}$를 적응적으로 변경.
-- **A2/A5 가점**: Severe DLC 또는 FMVSS 126 sine-with-dwell 통과 시 +3 pt. ESC의 R1.0 ≤ 0.35 검증에 시간이 필요했음.
+- Claude: 프로젝트 구조 파악, lateral/vertical/coordinator 설계 초안 검토, 보고서 구조 정리 보조
+- ChatGPT: longitudinal ABS 구조와 wheel slip feedback 설계 아이디어 검토, B1 결과 해석 보조
 
----
+AI 제안은 그대로 제출하지 않고 MATLAB simulation과 `grade.m` 결과를 기준으로 수정 여부를 결정하였다. 특히 최종 B1 ABS 개선은 `grade_report.json`의 stoppingDistance 66.4777 m, absSlipRMS 0.0863으로 검증하였다.
 
-## 6. 참고문헌
+## 8. 결론
 
-[1] ISO 3888-1:2018, *Passenger cars — Test track for a severe lane-change manoeuvre — Part 1: Double lane-change*.
+최종 통합 샤시 제어기는 P1 자동채점에서 `64.00 / 70.00`을 기록했다. A3, A4, A7, B1은 모두 핵심 KPI를 만족했고, A1/D1은 side-slip과 LTR은 만족했지만 lateralDevMax는 남은 한계로 남았다. 이 한계는 controller 입력에 path error가 없고 driver layer 수정이 과제 범위 밖이라는 구조적 제약과 관련이 있다.
 
-[2] ISO 4138:2021, *Passenger cars — Steady-state circular driving behaviour — Open-loop test methods*.
+따라서 최종 설계는 무리한 path tuning보다 안정성, ABS 성능, 제출 조건 준수, 재현 가능한 `grade_report.json` 생성을 우선한 균형점으로 판단한다.
 
-[3] ISO 7401:2011, *Road vehicles — Lateral transient response test methods — Open-loop test methods*.
+## 참고문헌
 
-[4] ISO 7975:2019, *Passenger cars — Braking in a turn — Open-loop test method*.
+[1] ISO 3888-1:2018, *Passenger cars - Test track for a severe lane-change manoeuvre - Part 1: Double lane-change*.
 
-[5] ISO 21994:2007, *Passenger cars — Stopping distance at straight-line braking with ABS — Open-loop test method*.
+[2] ISO 4138:2021, *Passenger cars - Steady-state circular driving behaviour - Open-loop test methods*.
 
-[6] UN-R 13H, *Uniform Provisions Concerning the Approval of Passenger Cars with regard to Braking*.
+[3] ISO 7401:2011, *Road vehicles - Lateral transient response test methods - Open-loop test methods*.
 
-[7] R. Rajamani, *Vehicle Dynamics and Control*, 2nd ed., Springer, 2012. §2.5 (yaw rate response, bicycle model), §8 (ESC).
+[4] ISO 7975:2019, *Passenger cars - Braking in a turn - Open-loop test method*.
 
-[8] J. Y. Wong, *Theory of Ground Vehicles*, 4th ed., Wiley, 2008. §5 (Handling characteristics).
+[5] ISO 21994:2007, *Passenger cars - Stopping distance at straight-line braking with ABS - Open-loop test method*.
 
-[9] D. Karnopp, M. J. Crosby, R. A. Harwood, "Vibration Control Using Semi-Active Force Generators," *J. of Engineering for Industry*, vol. 96, no. 2, pp. 619–626, 1974.
+[6] UN-R 13H, *Uniform provisions concerning the approval of passenger cars with regard to braking*.
 
-[10] H. B. Pacejka, *Tire and Vehicle Dynamics*, 3rd ed., Butterworth-Heinemann, 2012. §4 (Magic Formula).
+[7] R. Rajamani, *Vehicle Dynamics and Control*, 2nd ed., Springer, 2012.
 
-[11] V. Skrickij et al., "Review of Integrated Chassis Control Techniques for Automated Ground Vehicles," *Sensors*, vol. 24, no. 2, 600, 2024.
+[8] D. Karnopp, M. J. Crosby, and R. A. Harwood, "Vibration Control Using Semi-Active Force Generators," *Journal of Engineering for Industry*, vol. 96, no. 2, pp. 619-626, 1974.
 
----
-
-## 부록 A — 사용한 AI 도구
-
-본 과제를 진행하면서 Claude와 ChatGPT 두 가지 AI 도구를 사용하였습니다. 설계 방향과 게인 결정은 직접 시뮬레이션 결과를 보면서 정했고, AI는 주로 코드 초안과 보고서 문장 정리에 도움을 받는 용도로 활용했습니다.
-
-직접 결정한 부분은 다음과 같습니다.
-
-- 제어 기법으로 PID, β-limiter, Skyhook, brake 기반 ESC를 조합하기로 한 점. 학기 중 LQR도 공부했지만 비선형 ESC 조건과 결합하기 어려워서 PID 쪽이 더 안전하다고 판단했습니다.
-- 어느 시나리오에 시간을 더 쓸지 정한 것. A7이 베이스라인에서 sideSlipMax 30.5°로 가장 심각해서 ESC β-limiter 튜닝에 가장 오래 매달렸습니다.
-- 가점 항목으로 gain scheduling(+2)과 마찰원 분배(+3)를 노린 것. 코드 구조 바꾸지 않고 추가하기 쉬워 보였습니다.
-- PID 게인 비율(Kp ×2.5, Ki ×0.3, Kd ×2.0)은 시뮬을 여러 번 돌리면서 overshoot, settling, lateralDev 사이의 trade-off를 보고 정했습니다.
-- B1에서 처음에 stoppingDistance가 OFF와 ON이 똑같이 나와서 한참 헤맸는데, plant의 brake 합산 구조 때문에 양수 brake를 더해봐야 상한에 걸려 무시되고 음수 채널이 필요하다는 걸 알아냈습니다. 그 다음 ChatGPT에 음수 brake 채널 구조로 ABS 코드 초안을 요청했습니다.
-- 작업 도중 ctrl_lateral.m 첫 줄이 잘못 덮어쓰여서 6 시나리오가 전부 0점이 나온 적이 있었는데, 매번 수정 전에 백업 파일을 만들어 두던 덕에 바로 60.78점 코드로 복원했습니다.
-
-**Claude (Anthropic)** 사용 범위:
-
-- 프로젝트 시작 단계의 워크플로 가이드 (fork, MATLAB 초기화 등)
-- ctrl_lateral.m, ctrl_vertical.m, ctrl_coordinator.m 의 초안 코드
-- 보고서 구조와 LaTeX 수식 정리 보조
-
-**ChatGPT (OpenAI)** 사용 범위:
-
-- ctrl_longitudinal.m 의 ABS P-band 구조 초안
-- 게인 값과 brake detection 조건은 직접 시뮬을 돌려보면서 다시 조정했습니다.
-
-AI가 만든 코드를 그대로 쓰진 않았고, grade.m 점수가 떨어지면 게인을 바꾸거나 백업으로 되돌리면서 60.78점까지 올렸습니다.
-
----
-
-## 부록 B — sim_params.m 변경사항
-
-`config/sim_params.m` 내 본인이 수정 허용된 항목 중 변경한 부분 없음.
-
-기본 게인 값:
-- `CTRL.LAT.Kp = 1.0, Ki = 0.1, Kd = 0.05, intMax = 5.0`
-- `CTRL.LON.Kp = 0.5, Ki = 0.05`
-- `CTRL.VER.cMin = 500, cMax = 5000, skyGain = 2500`
-
-실제 적용 게인은 ctrl_lateral.m 내부에서 base 값에 scaling factor를 곱하는 방식으로 처리(gain scheduling).
-
-`SIM.solver`는 default ode45 유지.
-
----
-
-## 부록 C — Plot 생성 코드
-
-다음 MATLAB 스크립트로 §4의 plot 5장을 재현할 수 있다. `icc-project/` 폴더에서 실행:
-
-```matlab
-% --- A7 sideSlip 비교 ---
-[r_off, ~] = run_icc_scenario('A7','14dof','Controller','off','SavePlot',false);
-[r_on,  ~] = run_icc_scenario('A7','14dof','Controller','on', 'SavePlot',false);
-figure; plot(r_off.t, rad2deg(r_off.sideSlip), 'r-', 'LineWidth', 1.5); hold on;
-plot(r_on.t,  rad2deg(r_on.sideSlip),  'b-', 'LineWidth', 1.5);
-xlabel('time [s]'); ylabel('\beta [deg]');
-legend('off (baseline)','on (designed)','Location','best');
-title('A7 Brake-in-Turn — sideSlipMax');
-grid on; saveas(gcf, 'docs/figures/a7_sideSlip.png');
-
-% --- A7 trajectory ---
-figure; plot(r_off.x_pos, r_off.y_pos, 'r-', r_on.x_pos, r_on.y_pos, 'b-', ...
-             'LineWidth', 1.5);
-xlabel('x [m]'); ylabel('y [m]'); axis equal;
-legend('off (baseline)','on (designed)');
-title('A7 — Vehicle Trajectory');
-grid on; saveas(gcf, 'docs/figures/a7_trajectory.png');
-
-% --- B1 wheel slip ---
-[r_off, ~] = run_icc_scenario('B1','14dof','Controller','off','SavePlot',false);
-[r_on,  ~] = run_icc_scenario('B1','14dof','Controller','on', 'SavePlot',false);
-figure; plot(r_off.t, r_off.wheelSlip(:,1), 'r-', r_on.t, r_on.wheelSlip(:,1), 'b-', ...
-             'LineWidth', 1.5);
-xlabel('time [s]'); ylabel('\kappa_{FL}');
-legend('off','on'); title('B1 — Front-Left Wheel Slip Ratio');
-grid on; saveas(gcf, 'docs/figures/b1_kappa.png');
-
-% --- B1 brake ---
-figure; subplot(2,1,1);
-plot(r_off.t, r_off.v_x*3.6, 'r-', r_on.t, r_on.v_x*3.6, 'b-', 'LineWidth', 1.5);
-ylabel('v_x [km/h]'); legend('off','on'); grid on;
-subplot(2,1,2);
-plot(r_off.t, r_off.a_x, 'r-', r_on.t, r_on.a_x, 'b-', 'LineWidth', 1.5);
-xlabel('time [s]'); ylabel('a_x [m/s^2]'); grid on;
-sgtitle('B1 — Deceleration');
-saveas(gcf, 'docs/figures/b1_brake.png');
-
-% --- A1 path ---
-[r_off, ~] = run_icc_scenario('A1','14dof','Controller','off','SavePlot',false);
-[r_on,  ~] = run_icc_scenario('A1','14dof','Controller','on', 'SavePlot',false);
-figure; plot(r_off.scenario.refPath(:,1), r_off.scenario.refPath(:,2), 'k:', ...
-             r_off.x_pos, r_off.y_pos, 'r-', r_on.x_pos, r_on.y_pos, 'b-', ...
-             'LineWidth', 1.5);
-xlabel('x [m]'); ylabel('y [m]'); axis equal;
-legend('refPath','off (baseline)','on (designed)','Location','best');
-title('A1 ISO 3888-1 DLC — Path Following');
-grid on; saveas(gcf, 'docs/figures/a1_path.png');
-```
-
----
-
-## 부록 D — 코드 무결성 정보
-
-`icc-project/grade_report.json` (2026-06-23 03:55:13 KST 생성):
-
-- `quantitative.score`: 60.78 / 70
-- `deductions.amount`: 0
-- `final_auto`: 60.78
-- `ctrl_signature`: 4개 ctrl_*.m 의 SHA256 hash (lateral / longitudinal / vertical / coordinator 순서 concat, CRLF→LF 정규화)
-- `matlab_version`: 9.14 R2023a
-- `solver_used`: ode45
-
-본 fork의 GitHub Actions(`.github/workflows/classroom.yml`)가 `ctrl_signature` 와 실제 ctrl_*.m 파일의 hash 일치 여부를 자동 검증한다. `grade_report.json` 수동 편집은 자동 차단된다.
+[9] H. B. Pacejka, *Tire and Vehicle Dynamics*, 3rd ed., Butterworth-Heinemann, 2012.
