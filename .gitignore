@@ -37,3 +37,4 @@ Thumbs.db
 
 # 학생 fork 산출물 (template 에 들어가더라도 무방)
 **/student_info.local.m
+icc-project/scripts/control/_backup/
